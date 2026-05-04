@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kinetic Sphere — Hand Tracking</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700&family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{overflow:hidden;background:#030308;font-family:'Inter',sans-serif;color:#fff;height:100vh;width:100vw}
+#canvas-container{position:fixed;top:0;left:0;width:100%;height:100%;z-index:1}
+#video-bg{position:fixed;top:0;left:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity 1s;z-index:0;transform:scaleX(-1);pointer-events:none}
+#video-bg.on{opacity:0.15}
+.ui{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:10;padding:2rem}
+.title{font-family:'Playfair Display',serif;font-size:clamp(2rem,5vw,3.5rem);font-weight:400;background:linear-gradient(135deg,#fff 0%,#666 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.sub{font-size:0.8rem;color:#555;margin-top:0.6rem;line-height:1.6;max-width:340px;letter-spacing:0.3px}
+.btns{position:fixed;bottom:2rem;left:2rem;display:flex;gap:0.8rem;z-index:10}
+.btn{pointer-events:auto;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);color:#aaa;padding:12px 24px;font-family:'Inter',sans-serif;font-size:0.75rem;letter-spacing:2px;text-transform:uppercase;cursor:pointer;border-radius:50px;transition:all .4s;backdrop-filter:blur(12px)}
+.btn:hover{background:rgba(255,255,255,0.1);color:#fff;border-color:rgba(255,255,255,0.25);transform:translateY(-2px);box-shadow:0 8px 25px rgba(0,0,0,0.3)}
+#status{position:fixed;bottom:2rem;right:2rem;font-size:0.7rem;letter-spacing:3px;text-transform:uppercase;color:#333;z-index:10;transition:color .5s}
+#status.active{color:#0fa}
+#charge-ring{position:fixed;width:120px;height:120px;border-radius:50%;pointer-events:none;z-index:5;opacity:0;transition:opacity .15s}
+#charge-ring canvas{width:100%;height:100%}
+#shockwave{position:fixed;top:50%;left:50%;width:0;height:0;border-radius:50%;border:2px solid rgba(0,255,200,0.6);pointer-events:none;z-index:4;transform:translate(-50%,-50%);opacity:0}
+#loader{position:fixed;top:0;left:0;width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:50;background:#030308;transition:opacity .8s}
+.spin{width:40px;height:40px;border:2px solid rgba(255,255,255,0.08);border-top-color:#fff;border-radius:50%;animation:sp 1s ease infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.load-txt{margin-top:1.5rem;font-size:0.7rem;letter-spacing:5px;text-transform:uppercase;color:#555}
+.gesture-hint{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);font-size:1.2rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,0);pointer-events:none;z-index:11;transition:color .3s;font-weight:300}
+.gesture-hint.show{color:rgba(255,255,255,0.5)}
+</style>
+</head>
+<body>
+<video id="video-bg" autoplay playsinline></video>
+<div id="canvas-container"></div>
+<div id="charge-ring"><canvas id="ring-canvas" width="120" height="120"></canvas></div>
+<div id="shockwave"></div>
+<div class="ui">
+  <div class="title">Kinetic Sphere</div>
+  <div class="sub">Move hand to control · Pinch to charge & explode · Clap to burst · Two hands to scale · Finger count changes color</div>
+</div>
+<div class="btns">
+  <button class="btn" id="toggle-cam">Camera BG</button>
+</div>
+<div id="status">● No Hand</div>
+<div class="gesture-hint" id="gesture-hint"></div>
+<div id="loader"><div class="spin"></div><div class="load-txt">Loading Model</div></div>
+
+<script>
+// ─── CONFIG ───
+const N = 3000, RAD = 2.5, BG_PARTICLES = 800;
+
+// ─── SMOOTHING HELPER ───
+class Smoother {
+  constructor(factor=0.35){ this.f=factor; this.v=null; }
+  update(val){
+    if(this.v===null){this.v={...val};return this.v;}
+    for(let k in val) this.v[k]+=(val[k]-this.v[k])*this.f;
+    return this.v;
+  }
+  reset(){this.v=null;}
+}
+
+// ─── STATE ───
+let isPinching=false, pinchProg=0, isExploded=false, explodeTime=0;
+let targetPos=new THREE.Vector3(), targetScale=1, targetColor=new THREE.Color(0xffffff);
+let curPos=new THREE.Vector3(), curScale=1, curColor=new THREE.Color(0xffffff);
+let prevPalmDist=null, clapCooldown=0;
+const palmSmoother1=new Smoother(0.4), palmSmoother2=new Smoother(0.4);
+let gestureText='', gestureTimer=0;
+
+// ─── THREE.JS ───
+const container=document.getElementById('canvas-container');
+const scene=new THREE.Scene();
+scene.fog=new THREE.FogExp2(0x030308,0.035);
+const cam=new THREE.PerspectiveCamera(60,innerWidth/innerHeight,0.1,500);
+cam.position.z=8;
+const ren=new THREE.WebGLRenderer({alpha:true,antialias:true,powerPreference:'high-performance'});
+ren.setSize(innerWidth,innerHeight);
+ren.setPixelRatio(Math.min(devicePixelRatio,2));
+container.appendChild(ren.domElement);
+
+// ─── PARTICLE TEXTURE ───
+function makeTexture(size,glow){
+  const c=document.createElement('canvas');c.width=c.height=size;
+  const x=c.getContext('2d'),g=x.createRadialGradient(size/2,size/2,0,size/2,size/2,size/2);
+  g.addColorStop(0,`rgba(255,255,255,${glow?1:.9})`);
+  g.addColorStop(0.2,`rgba(255,255,255,${glow?.7:.5})`);
+  g.addColorStop(1,'rgba(255,255,255,0)');
+  x.fillStyle=g;x.fillRect(0,0,size,size);
+  return new THREE.CanvasTexture(c);
+}
+
+// ─── MAIN SPHERE ───
+const geo=new THREE.BufferGeometry();
+const pos=new Float32Array(N*3),base=new Float32Array(N*3),vel=new Float32Array(N*3),col=new Float32Array(N*3),sizes=new Float32Array(N);
+for(let i=0;i<N;i++){
+  const phi=Math.acos(-1+(2*i)/N), th=Math.sqrt(N*Math.PI)*phi;
+  const x=RAD*Math.cos(th)*Math.sin(phi), y=RAD*Math.sin(th)*Math.sin(phi), z=RAD*Math.cos(phi);
+  const ix=i*3;
+  pos[ix]=base[ix]=x; pos[ix+1]=base[ix+1]=y; pos[ix+2]=base[ix+2]=z;
+  vel[ix]=vel[ix+1]=vel[ix+2]=0;
+  col[ix]=col[ix+1]=col[ix+2]=1;
+  sizes[i]=0.12+Math.random()*0.06;
+}
+geo.setAttribute('position',new THREE.BufferAttribute(pos,3));
+geo.setAttribute('color',new THREE.BufferAttribute(col,3));
+const mat=new THREE.PointsMaterial({size:0.14,vertexColors:true,transparent:true,opacity:0.85,map:makeTexture(64,true),depthWrite:false,blending:THREE.AdditiveBlending});
+const sphere=new THREE.Points(geo,mat);
+scene.add(sphere);
+
+// ─── BACKGROUND DUST ───
+const bgGeo=new THREE.BufferGeometry();
+const bgPos=new Float32Array(BG_PARTICLES*3),bgCol=new Float32Array(BG_PARTICLES*3);
+for(let i=0;i<BG_PARTICLES;i++){
+  const ix=i*3;
+  bgPos[ix]=(Math.random()-0.5)*60; bgPos[ix+1]=(Math.random()-0.5)*40; bgPos[ix+2]=(Math.random()-0.5)*30-5;
+  bgCol[ix]=bgCol[ix+1]=bgCol[ix+2]=0.15+Math.random()*0.1;
+}
+bgGeo.setAttribute('position',new THREE.BufferAttribute(bgPos,3));
+bgGeo.setAttribute('color',new THREE.BufferAttribute(bgCol,3));
+const bgMat=new THREE.PointsMaterial({size:0.06,vertexColors:true,transparent:true,opacity:0.5,map:makeTexture(32,false),depthWrite:false,blending:THREE.AdditiveBlending});
+scene.add(new THREE.Points(bgGeo,bgMat));
+
+// ─── ORBIT RING ───
+const ringGeo=new THREE.BufferGeometry();
+const ringPts=[];
+for(let i=0;i<=128;i++){const a=(i/128)*Math.PI*2;ringPts.push(Math.cos(a)*RAD*1.15,0,Math.sin(a)*RAD*1.15);}
+ringGeo.setAttribute('position',new THREE.Float32BufferAttribute(ringPts,3));
+const ringLine=new THREE.Line(ringGeo,new THREE.LineBasicMaterial({color:0xffffff,transparent:true,opacity:0.06}));
+scene.add(ringLine);
+
+// ─── RESIZE ───
+addEventListener('resize',()=>{cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();ren.setSize(innerWidth,innerHeight);});
+
+// ─── CHARGE RING CANVAS ───
+const ringCanvas=document.getElementById('ring-canvas'), rCtx=ringCanvas.getContext('2d');
+function drawChargeRing(progress,color){
+  rCtx.clearRect(0,0,120,120);
+  rCtx.beginPath();rCtx.arc(60,60,50,0,Math.PI*2);rCtx.strokeStyle='rgba(255,255,255,0.06)';rCtx.lineWidth=3;rCtx.stroke();
+  if(progress>0){
+    rCtx.beginPath();rCtx.arc(60,60,50,-Math.PI/2,-Math.PI/2+progress*Math.PI*2);
+    rCtx.strokeStyle=color;rCtx.lineWidth=4;rCtx.lineCap='round';rCtx.stroke();
+    rCtx.shadowBlur=20;rCtx.shadowColor=color;
+    rCtx.beginPath();rCtx.arc(60,60,50,-Math.PI/2,-Math.PI/2+progress*Math.PI*2);rCtx.stroke();
+    rCtx.shadowBlur=0;
+  }
+}
+
+// ─── SHOCKWAVE ───
+const shockEl=document.getElementById('shockwave');
+function fireShockwave(x,y,color){
+  shockEl.style.left=x+'px';shockEl.style.top=y+'px';
+  shockEl.style.borderColor=color;shockEl.style.width='0';shockEl.style.height='0';shockEl.style.opacity='1';
+  shockEl.offsetHeight; // force reflow
+  shockEl.style.transition='all 0.8s cubic-bezier(0.16,1,0.3,1)';
+  shockEl.style.width='600px';shockEl.style.height='600px';shockEl.style.opacity='0';
+  setTimeout(()=>{shockEl.style.transition='none';shockEl.style.width='0';shockEl.style.height='0';},900);
+}
+
+// ─── GESTURE HINT ───
+const hintEl=document.getElementById('gesture-hint');
+function showGesture(text){gestureText=text;gestureTimer=60;hintEl.textContent=text;hintEl.classList.add('show');}
+
+// ─── EXPLOSION ───
+function triggerExplosion(force=1.5){
+  if(isExploded)return;
+  isExploded=true;explodeTime=Date.now();
+  const p=geo.attributes.position.array;
+  for(let i=0;i<N;i++){
+    const ix=i*3,x=p[ix],y=p[ix+1],z=p[ix+2];
+    const len=Math.sqrt(x*x+y*y+z*z)+0.001;
+    const f=(0.3+Math.random()*1.8)*force;
+    vel[ix]=(x/len)*f+(Math.random()-0.5)*0.8;
+    vel[ix+1]=(y/len)*f+(Math.random()-0.5)*0.8;
+    vel[ix+2]=(z/len)*f+(Math.random()-0.5)*0.8;
+  }
+}
+
+// ─── MEDIAPIPE ───
+const videoEl=document.getElementById('video-bg');
+const statusEl=document.getElementById('status');
+const chargeEl=document.getElementById('charge-ring');
+
+function dist3d(a,b){return Math.sqrt((a.x-b.x)**2+(a.y-b.y)**2+(a.z-b.z)**2);}
+function dist2d(a,b){return Math.sqrt((a.x-b.x)**2+(a.y-b.y)**2);}
+
+function countFingers(lm,hand){
+  let f=0;
+  // Fingers: check tip vs pip (more reliable than tip vs dip)
+  if(lm[8].y<lm[6].y)f++;   // index
+  if(lm[12].y<lm[10].y)f++; // middle
+  if(lm[16].y<lm[14].y)f++; // ring
+  if(lm[20].y<lm[18].y)f++; // pinky
+  // Thumb: use x-axis, account for handedness (MediaPipe labels are from camera's perspective, mirrored)
+  if(hand==='Left'){if(lm[4].x<lm[3].x)f++;}
+  else{if(lm[4].x>lm[3].x)f++;}
+  return f;
+}
+
+function onResults(results){
+  // Hide loader
+  const loader=document.getElementById('loader');
+  if(loader&&loader.style.opacity!=='0'){loader.style.opacity='0';setTimeout(()=>loader.style.display='none',800);}
+  
+  if(clapCooldown>0)clapCooldown--;
+  
+  const hands=results.multiHandLandmarks;
+  const labels=results.multiHandedness;
+  if(!hands||hands.length===0){
+    targetPos.set(0,0,0);targetScale=1;targetColor.setHex(0xffffff);
+    chargeEl.style.opacity=0;pinchProg=0;isPinching=false;
+    statusEl.textContent='● No Hand';statusEl.classList.remove('active');
+    palmSmoother1.reset();palmSmoother2.reset();prevPalmDist=null;
+    return;
+  }
+  
+  statusEl.textContent=`● ${hands.length} Hand${hands.length>1?'s':''}`;statusEl.classList.add('active');
+  const asp=innerWidth/innerHeight;
+  
+  if(hands.length===1){
+    const lm=hands[0], label=labels[0].label;
+    const raw=lm[9];
+    const palm=palmSmoother1.update({x:raw.x,y:raw.y,z:raw.z});
+    
+    // Move sphere
+    targetPos.x=(0.5-palm.x)*14*asp;
+    targetPos.y=-(palm.y-0.5)*14;
+    
+    // ─── PINCH (thumb tip to index tip with hysteresis) ───
+    const pDist=dist3d(lm[4],lm[8]);
+    const pinchThreshold=isPinching?0.09:0.06; // hysteresis
+    
+    if(pDist<pinchThreshold){
+      if(!isPinching)showGesture('Charging');
+      isPinching=true;
+      pinchProg=Math.min(pinchProg+0.02,1);
+    } else {
+      if(isPinching&&pinchProg>0.7){
+        triggerExplosion(1+pinchProg);
+        const sp=getScreenPos(palm.x,palm.y);
+        fireShockwave(sp.x,sp.y,pinchProg>0.9?'rgba(0,255,200,0.7)':'rgba(255,255,255,0.5)');
+        showGesture('Explode');
+      }
+      isPinching=false;
+      pinchProg=Math.max(pinchProg-0.05,0);
+    }
+    
+    // Charge ring UI
+    if(pinchProg>0){
+      chargeEl.style.opacity=Math.min(pinchProg*1.5,1);
+      const sp=getScreenPos(palm.x,palm.y);
+      chargeEl.style.left=(sp.x-60)+'px';chargeEl.style.top=(sp.y-60)+'px';
+      const ringColor=pinchProg>0.7?`hsl(${160+pinchProg*40},100%,${50+pinchProg*20}%)`:`rgba(255,255,255,${pinchProg})`;
+      drawChargeRing(pinchProg,ringColor);
+    } else {
+      chargeEl.style.opacity=0;
+    }
+    
+    // Finger color
+    const fingers=countFingers(lm,label);
+    const palettes=[0xffffff,0x00ffc8,0xff2d55,0x0af,0xffaa00,0xb44aff];
+    targetColor.setHex(palettes[Math.min(fingers,5)]);
+    targetScale=1;
+    prevPalmDist=null;
+    
+  } else if(hands.length>=2){
+    // ─── TWO HANDS ───
+    const rawP1=hands[0][9],rawP2=hands[1][9];
+    const p1=palmSmoother1.update({x:rawP1.x,y:rawP1.y,z:rawP1.z});
+    const p2=palmSmoother2.update({x:rawP2.x,y:rawP2.y,z:rawP2.z});
+    
+    const d=Math.sqrt((p1.x-p2.x)**2+(p1.y-p2.y)**2);
+    
+    // ─── CLAP DETECTION ───
+    if(prevPalmDist!==null&&clapCooldown<=0){
+      const speed=prevPalmDist-d;
+      if(speed>0.08&&d<0.12){
+        triggerExplosion(2.5);
+        const cx=(1-(p1.x+p2.x)/2)*innerWidth, cy=((p1.y+p2.y)/2)*innerHeight;
+        fireShockwave(cx,cy,'rgba(255,100,50,0.8)');
+        showGesture('Clap Burst');
+        clapCooldown=30;
+      }
+    }
+    prevPalmDist=d;
+    
+    // Scale
+    targetScale=Math.max(0.3,Math.min(0.4+d*5,3));
+    
+    // Center
+    const cx=(p1.x+p2.x)/2, cy=(p1.y+p2.y)/2;
+    targetPos.x=(0.5-cx)*14*asp;
+    targetPos.y=-(cy-0.5)*14;
+    
+    chargeEl.style.opacity=0;pinchProg=0;isPinching=false;
+  }
+}
+
+function getScreenPos(nx,ny){return{x:(1-nx)*innerWidth,y:ny*innerHeight};}
+
+// ─── INIT MEDIAPIPE ───
+const hands=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
+hands.setOptions({maxNumHands:2,modelComplexity:1,minDetectionConfidence:0.65,minTrackingConfidence:0.55});
+hands.onResults(onResults);
+const camObj=new Camera(videoEl,{onFrame:async()=>{await hands.send({image:videoEl});},width:640,height:480});
+camObj.start();
+
+// ─── UI ───
+let camOn=false;
+document.getElementById('toggle-cam').onclick=()=>{camOn=!camOn;videoEl.classList.toggle('on',camOn);};
+
+// ─── ANIMATION LOOP ───
+const clock=new THREE.Clock();
+function animate(){
+  requestAnimationFrame(animate);
+  const dt=clock.getDelta(),t=clock.getElapsedTime();
+  
+  // Gesture hint fade
+  if(gestureTimer>0){gestureTimer--;if(gestureTimer<=0)hintEl.classList.remove('show');}
+  
+  // Smooth position, scale, color
+  curPos.lerp(targetPos,0.1);
+  sphere.position.copy(curPos);
+  ringLine.position.copy(curPos);
+  
+  curScale+=(targetScale-curScale)*0.08;
+  sphere.scale.setScalar(curScale);
+  ringLine.scale.setScalar(curScale);
+  
+  curColor.lerp(targetColor,0.06);
+  const c=geo.attributes.color.array;
+  for(let i=0;i<N;i++){
+    // Slight per-particle color variation for depth
+    const vary=0.85+Math.sin(i*0.5+t)*0.15;
+    c[i*3]=curColor.r*vary; c[i*3+1]=curColor.g*vary; c[i*3+2]=curColor.b*vary;
+  }
+  geo.attributes.color.needsUpdate=true;
+  
+  // Rotate
+  sphere.rotation.y+=0.004;
+  sphere.rotation.x+=0.0015;
+  ringLine.rotation.y=sphere.rotation.y;
+  ringLine.rotation.x=sphere.rotation.x+Math.PI/2;
+  ringLine.rotation.z=Math.sin(t*0.5)*0.3;
+  sphere.rotation.z=curPos.x*-0.04;
+  
+  // Pinch squeeze effect
+  if(isPinching){
+    const squeeze=1-pinchProg*0.15;
+    sphere.scale.set(curScale*squeeze,curScale*(1+pinchProg*0.1),curScale*squeeze);
+    mat.size=0.14+pinchProg*0.08;
+  } else {
+    mat.size=0.14;
+  }
+  
+  // Particle update
+  const p=geo.attributes.position.array;
+  
+  if(isExploded){
+    const elapsed=Date.now()-explodeTime;
+    const reforming=elapsed>1200;
+    let moving=false;
+    for(let i=0;i<N;i++){
+      const ix=i*3;
+      p[ix]+=vel[ix];p[ix+1]+=vel[ix+1];p[ix+2]+=vel[ix+2];
+      vel[ix]*=0.95;vel[ix+1]*=0.95;vel[ix+2]*=0.95;
+      if(reforming){
+        const dx=base[ix]-p[ix],dy=base[ix+1]-p[ix+1],dz=base[ix+2]-p[ix+2];
+        const spring=0.025+Math.min(elapsed-1200,3000)/3000*0.04;
+        vel[ix]+=dx*spring;vel[ix+1]+=dy*spring;vel[ix+2]+=dz*spring;
+        vel[ix]*=0.88;vel[ix+1]*=0.88;vel[ix+2]*=0.88;
+      }
+      if(Math.abs(vel[ix])>0.005||Math.abs(p[ix]-base[ix])>0.02)moving=true;
+    }
+    if(reforming&&!moving){
+      isExploded=false;
+      for(let i=0;i<N;i++){const ix=i*3;p[ix]=base[ix];p[ix+1]=base[ix+1];p[ix+2]=base[ix+2];}
+    }
+    geo.attributes.position.needsUpdate=true;
+  } else {
+    // Organic breathing
+    for(let i=0;i<N;i++){
+      const ix=i*3,off=i*0.008;
+      const breathe=1+Math.sin(t*1.2+off)*0.015;
+      p[ix]=base[ix]*breathe+Math.sin(t*2+off+base[ix+1])*0.025;
+      p[ix+1]=base[ix+1]*breathe+Math.cos(t*2.3+off+base[ix])*0.025;
+      p[ix+2]=base[ix+2]*breathe+Math.sin(t*1.7+off+base[ix+2])*0.025;
+    }
+    geo.attributes.position.needsUpdate=true;
+  }
+  
+  // Background dust drift
+  const bp=bgGeo.attributes.position.array;
+  for(let i=0;i<BG_PARTICLES;i++){
+    const ix=i*3;
+    bp[ix+1]+=Math.sin(t*0.3+i)*0.003;
+    bp[ix]+=Math.cos(t*0.2+i*0.5)*0.002;
+  }
+  bgGeo.attributes.position.needsUpdate=true;
+  
+  ren.render(scene,cam);
+}
+animate();
+</script>
+</body>
+</html>
